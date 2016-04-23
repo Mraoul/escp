@@ -1,0 +1,145 @@
+#!/usr/bin/env python
+
+import sys
+
+PY2 = sys.version_info[0] == 2
+PY3 = sys.version_info[0] == 3
+
+import json
+import argparse
+from threading import Thread, Lock
+
+if PY2:
+    import Queue as queue
+elif PY3:
+    import queue
+else:
+    raise RuntimeError("Unable to determine Python version")
+
+import elasticsearch
+from elasticsearch.helpers import reindex as elasticReindex, scan as elasticScan, streaming_bulk as elasticBulk, BulkIndexError
+
+def createDestinationIndex(dest, destIndex, mapping, shards, replicas, strict):
+    if dest.indices.exists(index=destIndex):
+        if strict:
+            raise Exception("Index already exists")
+        else:
+            return
+        
+    request = {}
+    if shards > 0 or replicas > -1:
+        request['settings'] = {}
+        if shards > 0:
+            request['settings']['number_of_shards'] = shards
+        if replicas > -1:
+            request['settings']['number_of_replicas'] = replicas
+
+    if mapping is not None:
+        request['mappings'] = mapping
+
+    dest.indices.create(index=destIndex, body=request)
+
+
+def parseLocation(location):
+    try:
+        (url, endpoint) = location.split('/', 1)
+        parts = endpoint.split('/')
+        if len(parts) > 2:
+            raise KeyError
+    except Exception as e:
+        raise KeyError
+
+    return (url, endpoint)
+
+def main():
+
+    parser = argparse.ArgumentParser(description='Copy indices within or between ElasticSearch clusters')
+    parser.add_argument('sourceIndex', type=str, help="The source cluster and index to transfer, e.g., http://localhost:9200/my.index")
+    parser.add_argument('destIndex', type=str, help="The destination cluster and index to transfer to, e.g., http://localhost:9200/my.destindex")
+    parser.add_argument('--ignore-health', action='store_true', default=False, dest='ignore_health', help='Ignore the health status of the input and output servers')
+    parser.add_argument('--strict', action='store_true', default=False, dest="strict", help='Destination Index must *not* exist and must be created')
+    parser.add_argument('--no-mapping', action='store_true', default=False, dest="no_mapping", help='Do not copy mapping over from source')
+    parser.add_argument('--chunk-size', type=int, default=500, dest="chunk_size", help="Number of docs to chunk up and send to destintation")
+    parser.add_argument('--workers', type=int, default=1, dest="workers", help="Number of bulk workers to run")
+    parser.add_argument('--shards', type=int, default=0, dest="shards",  help='Number of shards for output index')
+    parser.add_argument('--replicas', type=int, default=-1, dest="replicas", help='Number of replicas for output index')
+
+
+    options = parser.parse_args()
+
+    (sourceUrl, sourceIndex) = parseLocation(options.sourceIndex)
+    (destUrl, destIndex) = parseLocation(options.destIndex)
+
+    # Create ES connections
+    source = elasticsearch.Elasticsearch(hosts=sourceUrl)
+    if sourceUrl == destUrl:
+        dest = source
+    else:
+        dest = elasticsearch.Elasticsearch(hosts=destUrl)
+
+    try:
+        shealth = source.cluster.health()
+        dhealth = dest.cluster.health()
+    except Exception as e:
+        sys.stderr.write("Unable to assess health of clusters\n")
+
+    if not options.ignore_health:
+        if shealth['status'] != 'green':
+            sys.stderr.write("Source Cluster is not in green state\n")
+            sys.exit(1)
+        if dhealth['status'] != 'green':
+            sys.stderr.write("Destination Cluster is not in green state\n")
+            sys.exit(1)
+
+    # Get the Metadata Mapping from the source Index
+    if not options.no_mapping:
+        try:
+            srcMap = source.indices.get_mapping(index = sourceIndex)
+            srcMap = srcMap[sourceIndex]['mappings']
+        except Exception as e:
+            sys.stderr.write("Unable to get source mapping %s\n" % str(e))
+            sys.exit(1)
+    else:
+        srcMap = None
+
+    # Create Metadata for output index
+    try:
+        createDestinationIndex(dest, destIndex, srcMap, options.shards, options.replicas, options.strict)
+    except Exception as e:
+        sys.stderr.write("Unable to create destination Index, %s" % str(e))
+        sys.exit(1)
+
+    #elasticReindex(source, sourceIndex, destIndex, query = {"query": {"match_all":{}}}, target_client = dest if dest != source else None, chunk_size = options.chunk_size)
+
+    def scanGenerator(source, sourceIndex):
+        # Get total document count
+        total = source.count(index=sourceIndex)['count']
+        fmt = "\rProcessed: %%%dd of %%d | %%3d%%%%" % (len(str(total)))
+        processed = 0
+        for document in elasticScan(source, query={"query":{"match_all":{}}}, index=sourceIndex, size = 5000):
+            action = {
+                      '_op_type': 'index',
+                      '_index': document['_index'],
+                      '_type': document['_type'],
+                      '_id': document['_id'],
+                      '_source': document['_source']
+            }
+            percent = ((processed * 1.0) / total) * 100
+            sys.stdout.write(fmt % (processed, total, percent))
+            sys.stdout.flush()
+            processed += 1
+            yield action
+
+        sys.stdout.write("\nProcessing Complete")
+
+    try:
+        for response in elasticBulk(dest, scanGenerator(source, sourceIndex), chunk_size = options.chunk_size):#, thread_count = options.workers):
+            pass
+    except BulkIndexError as e:
+        raise
+    except KeyboardInterrupt as e:
+        sys.stdout.write("\n")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
