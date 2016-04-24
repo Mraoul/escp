@@ -7,7 +7,8 @@ PY3 = sys.version_info[0] == 3
 
 import json
 import argparse
-from threading import Thread, Lock
+import time
+from threading import Thread, Event
 
 if PY2:
     import Queue as queue
@@ -17,7 +18,55 @@ else:
     raise RuntimeError("Unable to determine Python version")
 
 import elasticsearch
-from elasticsearch.helpers import reindex as elasticReindex, scan as elasticScan, streaming_bulk as elasticBulk, BulkIndexError
+from elasticsearch.helpers import scan as elasticScan, streaming_bulk as elasticBulk, BulkIndexError
+
+scanFinishedEvent = Event()
+
+def scanGenerator(docQueue):
+    global scanFinishedEvent
+    while 1:
+        try:
+            action = docQueue.get_nowait()
+            yield action
+        except queue.Empty as e:
+            if scanFinishedEvent.is_set():
+                break
+            time.sleep(.0001)
+
+def scanThread(source, sourceIndex, indexMap, docQueue, create_only):
+    global scanFinishedEvent
+    # Get total document count
+    total = source.count(index=sourceIndex)['count']
+    fmt = "\rProcessed: %%%dd of %%d | %%3d%%%%" % (len(str(total)))
+    processed = 0
+    starttime = 0
+    for document in elasticScan(source, query={"query":{"match_all":{}}}, index=sourceIndex, size = 5000):
+        action = {
+                  '_op_type': 'create' if create_only else 'index',
+                  '_index': indexMap[document['_index']],
+                  '_type': document['_type'],
+                  '_id': document['_id'],
+                  '_source': document['_source']
+        }
+        percent = ((processed * 1.0) / total) * 100
+        now = time.time()
+        if (now - starttime) > 1:
+            sys.stdout.write(fmt % (processed, total, percent))
+            sys.stdout.flush()
+            starttime = now
+        processed += 1
+        docQueue.put(action)
+
+    sys.stdout.write(fmt % (processed, total, percent))
+    sys.stdout.flush()
+    scanFinishedEvent.set()
+
+def bulkThread(dest, docQueue, chunk_size):
+    try:
+        for _ in elasticBulk(dest, scanGenerator(docQueue), chunk_size = chunk_size):
+            pass
+    except BulkIndexError as e:
+        raise
 
 def createDestinationIndex(dest, destIndex, mapping, shards, replicas, strict):
     if dest.indices.exists(index=destIndex):
@@ -56,19 +105,23 @@ def main():
     parser = argparse.ArgumentParser(description='Copy indices within or between ElasticSearch clusters')
     parser.add_argument('sourceIndex', type=str, help="The source cluster and index to transfer, e.g., http://localhost:9200/my.index")
     parser.add_argument('destIndex', type=str, help="The destination cluster and index to transfer to, e.g., http://localhost:9200/my.destindex")
-    parser.add_argument('--ignore-health', action='store_true', default=False, dest='ignore_health', help='Ignore the health status of the input and output servers')
-    parser.add_argument('--strict', action='store_true', default=False, dest="strict", help='Destination Index must *not* exist and must be created')
-    parser.add_argument('--no-mapping', action='store_true', default=False, dest="no_mapping", help='Do not copy mapping over from source')
-    parser.add_argument('--chunk-size', type=int, default=500, dest="chunk_size", help="Number of docs to chunk up and send to destintation")
-    parser.add_argument('--workers', type=int, default=1, dest="workers", help="Number of bulk workers to run")
-    parser.add_argument('--shards', type=int, default=0, dest="shards",  help='Number of shards for output index')
-    parser.add_argument('--replicas', type=int, default=-1, dest="replicas", help='Number of replicas for output index')
+    parser.add_argument('-i', '--ignore-health', action='store_true', default=False, dest='ignore_health', help='Ignore the health status of the input and output servers')
+    parser.add_argument('-s', '--strict', action='store_true', default=False, dest="strict", help='Destination Index must *not* exist and must be created')
+    parser.add_argument('-c', '--create-only', action='store_true', default=False, dest="create_only", help='Only create new entries, if an entry with a given id exists already it will not be overwritten/updated')
+    parser.add_argument('-m', '--no-mapping', action='store_true', default=False, dest="no_mapping", help='Do not copy mapping over from source')
+    parser.add_argument('-w', '--workers', type=int, default=1, dest="workers", help="Number of bulk workers to run")
+    parser.add_argument('-C', '--chunk-size', type=int, default=1000, dest="chunk_size", help="Number of docs to chunk up and send to destintation")
+    parser.add_argument('-S', '--shards', type=int, default=0, dest="shards",  help='Number of shards for output index')
+    parser.add_argument('-R', '--replicas', type=int, default=-1, dest="replicas", help='Number of replicas for output index')
 
 
     options = parser.parse_args()
 
     (sourceUrl, sourceIndex) = parseLocation(options.sourceIndex)
     (destUrl, destIndex) = parseLocation(options.destIndex)
+
+    if destIndex == '':
+        destIndex = None
 
     # Create ES connections
     source = elasticsearch.Elasticsearch(hosts=sourceUrl)
@@ -91,55 +144,100 @@ def main():
             sys.stderr.write("Destination Cluster is not in green state\n")
             sys.exit(1)
 
-    # Get the Metadata Mapping from the source Index
-    if not options.no_mapping:
-        try:
-            srcMap = source.indices.get_mapping(index = sourceIndex)
-            srcMap = srcMap[sourceIndex]['mappings']
-        except Exception as e:
-            sys.stderr.write("Unable to get source mapping %s\n" % str(e))
-            sys.exit(1)
-    else:
-        srcMap = None
-
-    # Create Metadata for output index
+    # Get the mapping and also the list of indices the sourceIndex expands to (if applicable)
     try:
-        createDestinationIndex(dest, destIndex, srcMap, options.shards, options.replicas, options.strict)
+        esMap = source.indices.get_mapping(index = sourceIndex)
+        indices = esMap.keys()
+    except Exception as e:
+        sys.stderr.write("Unable to get source mapping %s\n" % str(e))
+        sys.exit(1)
+
+    if options.no_mapping:
+        destMap = None
+    else:
+        destMap = {}
+
+    # Figure out all of the destination Indices based on the source indices
+    # Also determine mapping
+    indexMap = {}
+    try:
+        destIndices = []
+        if destIndex is not None:
+            if '*' in destIndex: #Expand all *'s to include the indices names
+                if destIndex == '*' and source == dest: # Make sure its not copying within the same cluster
+                    sys.stderr.write("Unable to copy within a cluster without specfying some destination\n")
+                    sys.exit(1)
+                for index in indices:
+                    dIndName = destIndex.replace('*', index)
+                    destIndices.append(dIndName)
+                    indexMap[index] = dIndName
+                    if not options.no_mapping:
+                        # Add a mapping entry for every destination index
+                        destMap[dIndName] = esMap[index]['mappings']
+            else: # Single Destination
+                destIndices.append(destIndex)
+                for index in indices:
+                    indexMap[index] = destIndex
+                if not options.no_mapping:
+                    # Create a combined mapping
+                    dmap ={}
+                    for index in indices:
+                        dmap.update(esMap[index]['mappings'])
+                    destMap[destIndex] = dmap
+        else:
+            if source == dest:
+                sys.stderr.write("Unable to copy within a cluster without specfying some destination\n")
+                sys.exit(1)
+
+            for index in indices:
+                destIndices.append(index)
+                indexMap[index] = index
+                if not options.no_mapping:
+                    destMap[index] = esMap[index]['mappings']
+        if len(destIndices) == 0:
+            raise Exception()
+    except Exception as e:
+        sys.stderr.write("Unable to determine destination indices %s\n" % str(e))
+        sys.exit(1)
+
+
+    # Create Metadata for output indices
+    try:
+        for index in destIndices:
+            createDestinationIndex(dest, index, destMap[index] if destMap is not None else None, options.shards, options.replicas, options.strict)
     except Exception as e:
         sys.stderr.write("Unable to create destination Index, %s" % str(e))
         sys.exit(1)
 
-    #elasticReindex(source, sourceIndex, destIndex, query = {"query": {"match_all":{}}}, target_client = dest if dest != source else None, chunk_size = options.chunk_size)
+    docQueue = queue.Queue(maxsize = options.chunk_size * options.workers)
 
-    def scanGenerator(source, sourceIndex):
-        # Get total document count
-        total = source.count(index=sourceIndex)['count']
-        fmt = "\rProcessed: %%%dd of %%d | %%3d%%%%" % (len(str(total)))
-        processed = 0
-        for document in elasticScan(source, query={"query":{"match_all":{}}}, index=sourceIndex, size = 5000):
-            action = {
-                      '_op_type': 'index',
-                      '_index': document['_index'],
-                      '_type': document['_type'],
-                      '_id': document['_id'],
-                      '_source': document['_source']
-            }
-            percent = ((processed * 1.0) / total) * 100
-            sys.stdout.write(fmt % (processed, total, percent))
-            sys.stdout.flush()
-            processed += 1
-            yield action
+    bulk_threads = []
+    for _ in range(options.workers):
+        bulkthread = Thread(target = bulkThread, args = (dest, docQueue, options.chunk_size))
+        bulkthread.daemon = True
+        bulkthread.start()
+        bulk_threads.append(bulkthread)
 
-        sys.stdout.write("\nProcessing Complete")
+    scan_thread = Thread(target = scanThread, args = (source, sourceIndex, indexMap, docQueue, options.create_only))
+    scan_thread.daemon = True
+    scan_thread.start()
 
     try:
-        for response in elasticBulk(dest, scanGenerator(source, sourceIndex), chunk_size = options.chunk_size):#, thread_count = options.workers):
-            pass
-    except BulkIndexError as e:
-        raise
+        while 1:
+            scan_thread.join(.01)
+            if not scan_thread.isAlive():
+                break
+
+        sys.stdout.write("\nSource Ingestion Complete\n")
+
+        for bt in bulk_threads:
+            bt.join()
+
     except KeyboardInterrupt as e:
         sys.stdout.write("\n")
         sys.exit(0)
+
+    sys.stdout.write("Processing Complete\n")
 
 if __name__ == "__main__":
     main()
