@@ -5,9 +5,11 @@ import sys
 PY2 = sys.version_info[0] == 2
 PY3 = sys.version_info[0] == 3
 
+import traceback
 import json
 import argparse
 import time
+import re
 from threading import Thread, Event
 
 if PY2:
@@ -21,6 +23,13 @@ import elasticsearch
 from elasticsearch.helpers import scan as elasticScan, streaming_bulk as elasticBulk, BulkIndexError
 
 scanFinishedEvent = Event()
+
+def generateDestination(regexMatches, dReps, destinationPattern):
+    destination = destinationPattern
+    for rep in dReps:
+        repstring = '?{' + str(rep) + '}'
+        destination = destination.replace(repstring, regexMatches[rep - 1])
+    return destination
 
 def scanGenerator(docQueue):
     global scanFinishedEvent
@@ -110,6 +119,7 @@ def main():
     parser.add_argument('-c', '--create-only', action='store_true', default=False, dest="create_only", help='Only create new entries, if an entry with a given id exists already it will not be overwritten/updated')
     parser.add_argument('-m', '--no-mapping', action='store_true', default=False, dest="no_mapping", help='Do not copy mapping over from source')
     parser.add_argument('-w', '--workers', type=int, default=1, dest="workers", help="Number of bulk workers to run")
+    parser.add_argument('-r', '--sourceregex', type=str, default = None, dest="srcregex", help="Use formating for destination best on source index regex")
     parser.add_argument('-C', '--chunk-size', type=int, default=1000, dest="chunk_size", help="Number of docs to chunk up and send to destintation")
     parser.add_argument('-S', '--shards', type=int, default=0, dest="shards",  help='Number of shards for output index')
     parser.add_argument('-R', '--replicas', type=int, default=-1, dest="replicas", help='Number of replicas for output index')
@@ -161,21 +171,44 @@ def main():
     # Also determine mapping
     indexMap = {}
     try:
-        destIndices = []
         if destIndex is not None:
-            if '*' in destIndex: #Expand all *'s to include the indices names
+            if options.srcregex is not None:
+                reg = re.compile(options.srcregex)
+                dreg = re.compile('\?{(\d+)}')
+                try:
+                    dmatch = [int(i) for i in dreg.findall(options.destIndex)]
+                    if len(dmatch) == 0:
+                        raise Exception()
+                except Exception as e:
+                    sys.stderr.write("Unable to parse regex replacements in destination Index\n")
+                    sys.exit(1)
+
+                for index in indices:
+                    m = reg.match(index)
+                    if m is None:
+                        sys.stderr.write("Unable to match source index with pattern\n")
+                        sys.exit(1)
+                    try:
+                        dIndName = generateDestination(m.groups(), dmatch, destIndex)
+                    except Exception as e:
+                        sys.stderr.write("Unable to generate destination index name\n")
+                        sys.exit(1)
+
+                    indexMap[index] = dIndName
+                    if not options.no_mapping:
+                        # Add a mapping entry for every destination index
+                        destMap[dIndName] = esMap[index]['mappings']
+            elif '*' in destIndex: #Expand all *'s to include the indices names
                 if destIndex == '*' and source == dest: # Make sure its not copying within the same cluster
                     sys.stderr.write("Unable to copy within a cluster without specfying some destination\n")
                     sys.exit(1)
                 for index in indices:
                     dIndName = destIndex.replace('*', index)
-                    destIndices.append(dIndName)
                     indexMap[index] = dIndName
                     if not options.no_mapping:
                         # Add a mapping entry for every destination index
                         destMap[dIndName] = esMap[index]['mappings']
             else: # Single Destination
-                destIndices.append(destIndex)
                 for index in indices:
                     indexMap[index] = destIndex
                 if not options.no_mapping:
@@ -190,20 +223,18 @@ def main():
                 sys.exit(1)
 
             for index in indices:
-                destIndices.append(index)
                 indexMap[index] = index
                 if not options.no_mapping:
                     destMap[index] = esMap[index]['mappings']
-        if len(destIndices) == 0:
+        if len(indexMap.keys()) == 0:
             raise Exception()
     except Exception as e:
-        sys.stderr.write("Unable to determine destination indices %s\n" % str(e))
+        sys.stderr.write("Unable to determine destination indices %s\n" % (str(e)))
         sys.exit(1)
-
 
     # Create Metadata for output indices
     try:
-        for index in destIndices:
+        for index in set(indexMap.values()):
             createDestinationIndex(dest, index, destMap[index] if destMap is not None else None, options.shards, options.replicas, options.strict)
     except Exception as e:
         sys.stderr.write("Unable to create destination Index, %s" % str(e))
