@@ -119,7 +119,7 @@ def main():
     parser.add_argument('-c', '--create-only', action='store_true', default=False, dest="create_only", help='Only create new entries, if an entry with a given id exists already it will not be overwritten/updated')
     parser.add_argument('-m', '--no-mapping', action='store_true', default=False, dest="no_mapping", help='Do not copy mapping over from source')
     parser.add_argument('-w', '--workers', type=int, default=1, dest="workers", help="Number of bulk workers to run")
-    parser.add_argument('-r', '--sourceregex', type=str, default = None, dest="srcregex", help="Use formating for destination best on source index regex")
+    parser.add_argument('-r', '--source-regex', type=str, default = None, dest="srcregex", help="Use formating for destination best on source index regex")
     parser.add_argument('-C', '--chunk-size', type=int, default=1000, dest="chunk_size", help="Number of docs to chunk up and send to destintation")
     parser.add_argument('-S', '--shards', type=int, default=0, dest="shards",  help='Number of shards for output index')
     parser.add_argument('-R', '--replicas', type=int, default=-1, dest="replicas", help='Number of replicas for output index')
